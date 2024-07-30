@@ -1,0 +1,166 @@
+---
+- name: Automated Deployment and Configuration
+  hosts: hng
+  become: yes
+  vars:
+    # repo_url: "https://github.com/hngprojects/hng_boilerplate_nestjs.git"
+    # repo_branch: "devops"
+    app_dir: "/opt/stage_5b"
+    pg_pw_file: "/var/secrets/pg_pw.txt"
+    pg_admin_user: "ansible_hng_user"
+    pg_admin_password: "mcyvS9FYs5aVTkFW47W48rZOEmm8hSXM"
+    pg_database: "ansible_hng"
+    log_dir: "/var/log/stage_5b"
+
+  tasks:
+    - name: Create hng user with sudo privileges
+      user:
+        name: hng
+        state: present
+        groups: sudo
+        append: yes
+
+    - name: Update and upgrade apt packages
+      apt:
+        update_cache: yes
+        upgrade: yes
+
+    - name: Create necessary directories
+      file:
+        path: "{{ item }}"
+        state: directory
+        owner: hng
+        mode: '0755'
+      loop:
+        - /var/secrets
+        - "{{ log_dir }}"
+        - "{{ app_dir }}"
+
+    - name: Install required packages
+      apt:
+        name:
+          - git
+          - postgresql
+          - nginx
+          - nodejs
+          - npm
+          - rabbitmq-server
+          - acl
+        state: present
+        update_cache: yes
+  
+    - name: Mark repository directory as safe
+      shell: git config --global --add safe.directory "{{ app_dir }}"
+      args:
+        executable: /bin/bash
+
+    - name: Clone or update the repository
+      git:
+        repo: https://github.com/hngprojects/hng_boilerplate_nestjs.git
+        dest: "{{ app_dir }}"
+        version: devops
+        update: yes
+        accept_hostkey: yes
+        force: yes
+
+    - name: Ensure app directory is owned by hng user
+      file:
+        path: "{{ app_dir }}"
+        owner: hng
+        group: hng
+        recurse: yes
+
+    - name: Create the .env file
+      copy:
+        dest: "{{ app_dir }}/.env"
+        content: |
+          PROFILE=local
+          NODE_ENV=development
+          PORT=3000
+          DB_USERNAME=ansible_hng_user
+          DB_PASSWORD=mcyvS9FYs5aVTkFW47W48rZOEmm8hSXM
+          DB_DATABASE=ansible_hng
+          DB_HOST=dpg-cqkcj5rqf0us73c785ug-a.oregon-postgres.render.com
+          DB_PORT=5432
+          DB_ENTITIES=dist/src/modules/**/entities/**/*.entity{.ts,.js}
+          DB_MIGRATIONS=dist/**/migrations/*{.ts,.js}
+          DB_TYPE=postgres
+          DB_SSL=true
+          JWT_SECRET=someSecrets
+          JWT_EXPIRY_TIMEFRAME=3600
+        owner: hng
+        group: hng
+        mode: "0600"
+
+    - name: Install application dependencies
+      npm:
+        path: "{{ app_dir }}"
+        state: present
+
+    - name: Start PostgreSQL service
+      service:
+        name: postgresql
+        state: started
+        enabled: yes
+
+    - name: Save PostgreSQL admin credentials
+      copy:
+        content: "PGUSER={{ pg_admin_user }}\nPGPASSWORD={{ pg_admin_password }}"
+        dest: "{{ pg_pw_file }}"
+        owner: hng
+        group: hng
+        mode: '0600'
+
+    - name: Start the application on port 3000
+      shell: |
+        su - hng -c "cd {{ app_dir }} && nohup npm start > {{ log_dir }}/out.log 2> {{ log_dir }}/error.log &"
+      args:
+        executable: /bin/bash
+
+    - name: Create Nginx configuration
+      copy:
+        content: |
+          server {
+              listen 80;
+              server_name _;
+              location / {
+                  proxy_pass http://127.0.0.1:3000;
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto $scheme;
+              }
+          }
+        dest: /etc/nginx/sites-available/default
+        owner: root
+        group: root
+        mode: '0644'
+
+    - name: Restart Nginx
+      service:
+        name: nginx
+        state: restarted
+
+    - name: Check if the services are running
+      service:
+        name: "{{ item }}"
+        state: started
+        enabled: yes
+      loop:
+        - nginx
+        - postgresql
+        - rabbitmq-server
+
+  handlers:
+    - name: Reload Nginx
+      service:
+        name: nginx
+        state: reloaded
+
+    - name: Reload Environment
+      shell: |
+        if [ -f /etc/environment ]; then
+          . /etc/environment
+        fi
+      args:
+        executable: /bin/bash
